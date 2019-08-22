@@ -70,6 +70,7 @@ const (
 
 	videoEncoderRateCommand = 0x0020 // 32
 	videoStartCommand       = 0x0025 // 37
+	takePictureCommand      = 0x0030 // 48
 	exposureCommand         = 0x0034 // 52
 	timeCommand             = 0x0046 // 70
 	stickCommand            = 0x0050 // 80
@@ -133,6 +134,10 @@ const (
 	VideoBitRate4M VideoBitRate = 5
 )
 
+const msgHdr = 0xcc // 204
+
+const minPktSize = 11 // smallest possible raw packet
+
 // FlightData packet returned by the Tello
 type FlightData struct {
 	BatteryLow               bool
@@ -191,6 +196,21 @@ type Driver struct {
 	throttle       int
 	bouncing       bool
 	gobot.Eventer
+}
+
+// packet is our internal representation of the messages passed to/from the Tello
+type packet struct {
+	header        byte
+	size13        uint16
+	crc8          byte
+	fromDrone     bool // the following 4 fields are encoded in a single byte in the raw packet
+	toDrone       bool
+	packetType    uint8 // 3-bit
+	packetSubtype uint8 // 3-bit
+	messageID     uint16
+	sequence      uint16
+	payload       []byte
+	crc16         uint16
 }
 
 // NewDriver creates a driver for the Tello drone. Pass in the UDP port to use for the responses
@@ -834,6 +854,17 @@ func (d *Driver) SendDateTime() (err error) {
 	return
 }
 
+func (d *Driver) TakePicture() (err error) {
+  d.cmdMutex.Lock()
+  defer d.cmdMutex.Unlock()
+
+  d.seq++
+  pkt := newPacket(5, takePictureCommand, uint16(d.seq), 0)
+  _, err = d.cmdConn.Write(packetToBuffer(pkt))
+  fmt.Println("Sent take picture request")
+  return
+}
+
 // SendCommand is used to send a text command such as the initial connection request to the drone.
 func (d *Driver) SendCommand(cmd string) (err error) {
 	_, err = d.cmdConn.Write([]byte(cmd))
@@ -943,6 +974,53 @@ func (d *Driver) connectionString() string {
 	binary.LittleEndian.PutUint16(b[:], uint16(x))
 	res := fmt.Sprintf("conn_req:%s", b)
 	return res
+}
+
+// newPacket returns a packet with some fields populated
+func newPacket(pt uint8, cmd uint16, seq uint16, payloadSize int) (pkt packet) {
+  pkt.header = msgHdr
+  pkt.toDrone = true
+  pkt.packetType = pt
+  pkt.messageID = cmd
+  pkt.sequence = seq
+  if payloadSize > 0 {
+    pkt.payload = make([]byte, payloadSize)
+  }
+  return pkt
+}
+
+// pack the packet into raw buffer format and calculate CRCs etc.
+func packetToBuffer(pkt packet) (buff []byte) {
+  // create a buffer of the right size
+  payloadSize := len(pkt.payload)
+  packetSize := minPktSize + payloadSize
+  buff = make([]byte, packetSize)
+
+  // copy each field, manipulating if necessary
+  buff[0] = pkt.header
+  buff[1] = byte(packetSize << 3)
+  buff[2] = byte(packetSize >> 5)
+  buff[3] = CalculateCRC8(buff[0:3])
+  buff[4] = pkt.packetSubtype + (pkt.packetType << 3)
+  if pkt.toDrone {
+    buff[4] |= 0x40
+  }
+  if pkt.fromDrone {
+    buff[4] |= 0x80
+  }
+  buff[5] = byte(pkt.messageID)
+  buff[6] = byte(pkt.messageID >> 8)
+  buff[7] = byte(pkt.sequence)
+  buff[8] = byte(pkt.sequence >> 8)
+
+  for p := 0; p < payloadSize; p++ {
+    buff[9+p] = pkt.payload[p]
+  }
+  crc16 := CalculateCRC16(buff[0 : 9+payloadSize])
+  buff[9+payloadSize] = byte(crc16)
+  buff[10+payloadSize] = byte(crc16 >> 8)
+
+  return buff
 }
 
 func (f *FlightData) AirSpeed() float64 {
