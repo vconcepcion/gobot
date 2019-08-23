@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+  "io/ioutil"
 	"math"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -61,12 +63,15 @@ const (
 
 // the 16-bit messages and commands stored in bytes 6 & 5 of the packet
 const (
-	messageStart   = 0x00cc // 204
-	wifiMessage    = 0x001a // 26
-	videoRateQuery = 0x0028 // 40
-	lightMessage   = 0x0035 // 53
-	flightMessage  = 0x0056 // 86
-	logMessage     = 0x1050 // 4176
+	messageStart    = 0x00cc // 204
+	wifiMessage     = 0x001a // 26
+	videoRateQuery  = 0x0028 // 40
+	lightMessage    = 0x0035 // 53
+	flightMessage   = 0x0056 // 86
+  fileSizeMessage = 0x0062 // 98
+  fileDataMessage = 0x0063 // 99
+  fileDoneMessage = 0x0064 // 100
+	logMessage      = 0x1050 // 4176
 
 	videoEncoderRateCommand = 0x0020 // 32
 	videoStartCommand       = 0x0025 // 37
@@ -80,6 +85,16 @@ const (
 	throwtakeoffCommand     = 0x005d // 93
 	palmLandCommand         = 0x005e // 94
 	bounceCommand           = 0x1053 // 4179
+)
+
+// tello packet types, 3 and 7 currently unknown
+const (
+	ptExtended = 0
+	ptGet      = 1
+	ptData1    = 2
+	ptData2    = 4
+	ptSet      = 5
+	ptFlip     = 6
 )
 
 // FlipType is used for the various flips supported by the Tello.
@@ -138,6 +153,42 @@ const msgHdr = 0xcc // 204
 
 const minPktSize = 11 // smallest possible raw packet
 
+// fileType is the type of file being sent to/from the drone
+type fileType byte
+
+// Known File Types...
+const (
+	ftJPEG fileType = 1
+)
+
+type fileData struct {
+	fileType  fileType // 1 = JPEG
+	fileSize  int
+	fileBytes []byte
+}
+
+type fileInternal struct {
+	fID          uint16
+	filetype     fileType
+	expectedSize int
+	accumSize    int
+	pieces       []filePiece
+}
+
+type filePiece struct {
+	//fID       uint16
+	numChunks int
+	chunks    []fileChunk
+}
+
+type fileChunk struct {
+	fID       uint16
+	pieceNum  uint32
+	chunkNum  uint32
+	chunkLen  uint16
+	chunkData []byte
+}
+
 // FlightData packet returned by the Tello
 type FlightData struct {
 	BatteryLow               bool
@@ -191,10 +242,13 @@ type Driver struct {
 	respPort       string
 	videoPort      string
 	cmdMutex       sync.Mutex
+	fdMutex        sync.Mutex
 	seq            int16
 	rx, ry, lx, ly float32
 	throttle       int
 	bouncing       bool
+  files          []fileData
+  fileTemp       fileInternal
 	gobot.Eventer
 }
 
@@ -854,15 +908,108 @@ func (d *Driver) SendDateTime() (err error) {
 	return
 }
 
+// TakePicture requests the Tello to take a JPEG snapshot.
+// The process takes a little while to complete and the video may freeze
+// during photography.  Sometime the Tello does not honour the request.
+// The pictures are stored in the tello struct until saved by eg. SaveAllPics().
 func (d *Driver) TakePicture() (err error) {
   d.cmdMutex.Lock()
   defer d.cmdMutex.Unlock()
 
   d.seq++
-  pkt := newPacket(5, takePictureCommand, uint16(d.seq), 0)
+  pkt := newPacket(ptSet, takePictureCommand, uint16(d.seq), 0)
   _, err = d.cmdConn.Write(packetToBuffer(pkt))
   fmt.Println("Sent take picture request")
   return
+}
+
+// NumPics returns the number of JPEG pictures we are storing in memory
+func (d *Driver) NumPics() (np int) {
+	for _, f := range d.files {
+		if f.fileType == ftJPEG {
+			np++
+		}
+	}
+	return np
+}
+
+// SaveAllPics writes all JPEG pictures to disk using the given prefix
+// and a generated index number. It returns the number of pictures written &/or an error.
+// If there is no error, the pictures are removed from memory.
+func (d *Driver) SaveAllPics(prefix string) (np int, err error) {
+	for _, f := range d.files {
+		if f.fileType == ftJPEG {
+			filename := fmt.Sprintf("%s_%d.jpg", prefix, np)
+			err = ioutil.WriteFile(filename, f.fileBytes, 0644)
+			if err != nil {
+				return 0, err
+			}
+			np++
+		}
+	}
+	d.files = nil
+	return np, nil
+}
+
+func (d *Driver) sendFileSize() {
+	d.cmdMutex.Lock()
+	defer d.cmdMutex.Unlock()
+	d.seq++
+	d.cmdConn.Write(packetToBuffer(newPacket(ptData1, fileSizeMessage, uint16(d.seq), 1)))
+}
+
+func (d *Driver) sendFileAckPiece(done byte, fID uint16, pieceNum uint32) {
+	d.cmdMutex.Lock()
+	defer d.cmdMutex.Unlock()
+	d.seq++
+	pkt := newPacket(ptData1, fileDataMessage, uint16(d.seq), 7)
+	pkt.payload[0] = done
+	pkt.payload[1] = byte(fID)
+	pkt.payload[2] = byte(fID >> 8)
+	pkt.payload[3] = byte(pieceNum)
+	pkt.payload[4] = byte(pieceNum >> 8)
+	pkt.payload[5] = byte(pieceNum >> 16)
+	pkt.payload[6] = byte(pieceNum >> 24)
+	d.cmdConn.Write(packetToBuffer(pkt))
+}
+
+func (d *Driver) sendFileDone(fID uint16, size int) {
+	d.cmdMutex.Lock()
+	defer d.cmdMutex.Unlock()
+	d.seq++
+	pkt := newPacket(ptGet, fileDoneMessage, uint16(d.seq), 6)
+	pkt.payload[0] = byte(fID)
+	pkt.payload[1] = byte(fID >> 8)
+	pkt.payload[2] = byte(size)
+	pkt.payload[3] = byte(size >> 8)
+	pkt.payload[4] = byte(size >> 16)
+	pkt.payload[5] = byte(size >> 24)
+	d.cmdConn.Write(packetToBuffer(pkt))
+}
+
+// reassembleFile reassembles a chunked file in tello.fileTemp into a contiguous byte array in tello.files
+func (d *Driver) reassembleFile() {
+	var fd fileData
+	d.fdMutex.Lock()
+	defer d.fdMutex.Unlock()
+
+	fd.fileType = d.fileTemp.filetype
+	fd.fileSize = d.fileTemp.accumSize
+	// we expect the pieces to be in order
+	for _, p := range d.fileTemp.pieces {
+		// the chunks may not be in order, we must sort them
+		if p.numChunks > 1 {
+			sort.Slice(p.chunks, func(i, j int) bool {
+				return int(p.chunks[i].chunkNum) < int(p.chunks[j].chunkNum)
+			})
+		}
+		for _, c := range p.chunks {
+			fd.fileBytes = append(fd.fileBytes, c.chunkData...)
+		}
+	}
+	d.files = append(d.files, fd)
+  fmt.Println("Successfully reassembled file")
+	d.fileTemp = fileInternal{}
 }
 
 // SendCommand is used to send a text command such as the initial connection request to the drone.
@@ -882,6 +1029,7 @@ func (d *Driver) handleResponse(r io.Reader) error {
 	// parse binary packet
 	if buf[0] == messageStart {
 		msgType = (uint16(buf[6]) << 8) | uint16(buf[5])
+    pkt := bufferToPacket(buf[:])
 		switch msgType {
 		case wifiMessage:
 			buf := bytes.NewReader(buf[9:10])
@@ -911,6 +1059,57 @@ func (d *Driver) handleResponse(r io.Reader) error {
 		case flightMessage:
 			fd, _ := d.ParseFlightData(buf[9:])
 			d.Publish(d.Event(FlightDataEvent), fd)
+    case fileSizeMessage:
+      ft, fs, fID := payloadToFileInfo(pkt.payload)
+      fmt.Printf("Take pic response: type: %d, size: %d, ID: %d\n", ft, fs, fID)
+      if ft != ftJPEG {
+        fmt.Printf("Unexpected file type <%d> received in response to take picture command\n", ft)
+      } else {
+        // set up for receiving picture chunks
+        // d.files[fID] = fileData{fileType: ft, fileSize: fs, fileBytes: make([]byte, fs)}
+        d.fdMutex.Lock()
+        //d.filesBusy = true
+        d.fileTemp.fID = fID
+        d.fileTemp.filetype = ft
+        d.fileTemp.expectedSize = int(fs)
+        d.fileTemp.accumSize = 0
+        d.fileTemp.pieces = make([]filePiece, 1024)
+        d.fdMutex.Unlock()
+        // acknowledge the file size
+        d.sendFileSize()
+      }
+    case fileDataMessage:
+      thisChunk := payloadToFileChunk(pkt.payload)
+      d.fdMutex.Lock()
+      //fmt.Printf("Got pic chunk - ID: %d, Piece: %d, Chunk: %d\n", thisChunk.fID, thisChunk.pieceNum, thisChunk.chunkNum)
+      for len(d.fileTemp.pieces) <= int(thisChunk.pieceNum) {
+        d.fileTemp.pieces = append(d.fileTemp.pieces, filePiece{})
+      }
+      if d.fileTemp.pieces[thisChunk.pieceNum].numChunks < 8 {
+        // check if we already have this chunk
+        already := false
+        for _, c := range d.fileTemp.pieces[thisChunk.pieceNum].chunks {
+          if c.chunkNum == thisChunk.chunkNum {
+            already = true
+          }
+        }
+        if !already {
+          d.fileTemp.pieces[thisChunk.pieceNum].chunks = append(d.fileTemp.pieces[thisChunk.pieceNum].chunks, thisChunk)
+          d.fileTemp.accumSize += len(thisChunk.chunkData)
+          d.fileTemp.pieces[thisChunk.pieceNum].numChunks++
+        }
+      }
+      d.fdMutex.Unlock()
+      if d.fileTemp.pieces[thisChunk.pieceNum].numChunks == 8 {
+        // piece has 8 chunks, it's complete
+        d.sendFileAckPiece(0, thisChunk.fID, thisChunk.pieceNum)
+        //fmt.Printf("Acknowledging piece: %d\n", thisChunk.pieceNum)
+      }
+      if d.fileTemp.accumSize == d.fileTemp.expectedSize {
+        d.sendFileAckPiece(1, thisChunk.fID, thisChunk.pieceNum)
+        d.sendFileDone(thisChunk.fID, d.fileTemp.accumSize)
+        d.reassembleFile()
+      }
 		case exposureCommand:
 			d.Publish(d.Event(SetExposureEvent), buf[7:8])
 		case videoEncoderRateCommand:
@@ -1034,4 +1233,40 @@ func (f *FlightData) GroundSpeed() float64 {
 	return math.Sqrt(
 		math.Pow(float64(f.NorthSpeed), 2) +
 			math.Pow(float64(f.EastSpeed), 2))
+}
+
+// bufferToPacket takes a raw buffer of bytes and populates our packet struct
+func bufferToPacket(buff []byte) (pkt packet) {
+	pkt.header = buff[0]
+	pkt.size13 = (uint16(buff[1]) + uint16(buff[2])<<8) >> 3
+	pkt.crc8 = buff[3]
+	pkt.fromDrone = (buff[4] & 0x80) == 1
+	pkt.toDrone = (buff[4] & 0x40) == 1
+	pkt.packetType = uint8((buff[4] >> 3) & 0x07)
+	pkt.packetSubtype = uint8(buff[4] & 0x07)
+	pkt.messageID = (uint16(buff[6]) << 8) | uint16(buff[5])
+	pkt.sequence = (uint16(buff[8]) << 8) | uint16(buff[7])
+	payloadSize := pkt.size13 - 11
+	if payloadSize > 0 {
+		pkt.payload = make([]byte, payloadSize)
+		copy(pkt.payload, buff[9:9+payloadSize])
+	}
+	pkt.crc16 = uint16(buff[pkt.size13-1])<<8 + uint16(buff[pkt.size13-2])
+	return pkt
+}
+
+func payloadToFileInfo(pl []byte) (fType fileType, fSize uint32, fID uint16) {
+	fType = fileType(pl[0])
+	fSize = uint32(pl[1]) + uint32(pl[2])<<8 + uint32(pl[3])<<16 + uint32(pl[4])<<24
+	fID = uint16(pl[5]) + uint16(pl[6])<<8
+	return fType, fSize, fID
+}
+
+func payloadToFileChunk(pl []byte) (fc fileChunk) {
+	fc.fID = uint16(pl[0]) + uint16(pl[1])<<8
+	fc.pieceNum = uint32(pl[2]) + uint32(pl[3])<<8 + uint32(pl[4])<<16 + uint32(pl[5])<<24
+	fc.chunkNum = uint32(pl[6]) + uint32(pl[7])<<8 + uint32(pl[8])<<16 + uint32(pl[9])<<24
+	fc.chunkLen = uint16(pl[10]) + uint16(pl[11])<<8
+	fc.chunkData = pl[12:]
+	return fc
 }
